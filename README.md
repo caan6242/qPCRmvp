@@ -1,4 +1,4 @@
-# qPCR Studio MVP
+# qPCR Studio MVP v2
 
 A private web app for cleaned qPCR Ct data.
 
@@ -14,8 +14,7 @@ Input format:
 The app calculates:
 
 - replicate QC
-- replicate spread
-- optional exclusion when replicate spread exceeds cutoff
+- outlier replicate removal
 - mean Ct
 - housekeeping mean Ct
 - ΔCt
@@ -31,31 +30,31 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Then open the local URL Streamlit gives you.
-
 ## Deploy online
 
-The easiest route is Streamlit Community Cloud:
+Upload these files to your GitHub repo and redeploy on Streamlit Community Cloud.
 
-1. Put these files in a GitHub repo.
-2. Go to Streamlit Community Cloud.
-3. Connect the repo.
-4. Set the app file to `app.py`.
-5. Deploy.
-
-For private/lab use, deploy behind authentication or use a private hosting option.
-
-## Input rules
-
-Required columns:
+## Required columns
 
 - `Sample`
 - `Gene`
 - `Ct`
 
-Column names are case-insensitive. Extra columns are ignored for calculations.
+Column names are case-insensitive. Extra columns are ignored.
 
-## Notes on housekeeping normalization
+## v2 QC behavior
+
+This version does **not** remove an entire sample/gene group just because the full replicate spread is too large.
+
+Instead:
+
+- If all replicates are within the cutoff, all are kept.
+- If one replicate is an outlier, the app keeps the largest subset where max Ct - min Ct is within the cutoff.
+- With triplicates, this usually means keeping the two closest replicates and removing the odd one out.
+- A group only fails if it cannot find at least two replicates within the cutoff.
+- Single replicates are allowed but flagged as `WARN_single_replicate`.
+
+## Normalization
 
 Ct values are logarithmic. For multiple housekeeping genes, this app uses the arithmetic mean of housekeeping Ct values per sample, which is equivalent to using the geometric mean on the original expression scale.
 

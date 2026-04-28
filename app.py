@@ -16,11 +16,10 @@ class AnalysisSettings:
     control_sample: str
     housekeeping_genes: List[str]
     outlier_cutoff: float
-    exclude_failed_groups: bool
+    apply_qc: bool
 
 
 def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Make input column names predictable while preserving only needed fields."""
     col_map = {c.lower().strip(): c for c in df.columns}
     missing = [c for c in REQUIRED_COLUMNS if c.lower() not in col_map]
     if missing:
@@ -70,36 +69,107 @@ def make_example_data() -> pd.DataFrame:
             for _ in range(3):
                 ct = base_ct[gene] + effects.get(sample, {}).get(gene, 0) + rng.normal(0, 0.12)
                 rows.append({"Sample": sample, "Gene": gene, "Ct": round(float(ct), 3)})
+
+    # Add one deliberate outlier to demonstrate v2 QC.
+    rows.append({"Sample": "Control", "Gene": "TBP", "Ct": 25.7})
     return pd.DataFrame(rows)
 
 
+def select_replicates_for_group(values: pd.Series, cutoff: float) -> pd.Series:
+    """
+    Keep the largest subset of Ct values where max-min <= cutoff.
+    If several subsets have the same size, keep the subset with smallest spread.
+    """
+    vals = values.dropna().sort_values()
+
+    if len(vals) <= 1:
+        return pd.Series(True, index=values.index)
+
+    best_index = None
+    best_n = 0
+    best_spread = np.inf
+
+    sorted_items = list(vals.items())
+    for i in range(len(sorted_items)):
+        for j in range(i, len(sorted_items)):
+            subset = sorted_items[i : j + 1]
+            subset_values = [v for _, v in subset]
+            spread = max(subset_values) - min(subset_values)
+            n = len(subset)
+            if spread <= cutoff and n >= 2:
+                if n > best_n or (n == best_n and spread < best_spread):
+                    best_index = [idx for idx, _ in subset]
+                    best_n = n
+                    best_spread = spread
+
+    keep = pd.Series(False, index=values.index)
+    if best_index is not None:
+        keep.loc[best_index] = True
+    return keep
+
+
 def replicate_qc(raw: pd.DataFrame, settings: AnalysisSettings) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    grouped = raw.groupby(["Sample", "Gene"], as_index=False).agg(
-        n_replicates=("Ct", "count"),
-        min_ct=("Ct", "min"),
-        max_ct=("Ct", "max"),
-        mean_ct_all=("Ct", "mean"),
-        sd_ct_all=("Ct", "std"),
-    )
-    grouped["ct_spread"] = grouped["max_ct"] - grouped["min_ct"]
-    grouped["qc_status"] = np.where(
-        grouped["ct_spread"] > settings.outlier_cutoff,
-        "FAIL_spread_over_cutoff",
-        "PASS",
-    )
+    """
+    QC rule:
+    - If all replicates fit within the cutoff, keep all.
+    - If one or more values are outside, keep the largest subset with spread <= cutoff.
+    - If at least two replicates remain, calculate using those.
+    - If no pair fits within cutoff, exclude that sample/gene group from calculations.
+    """
+    rows = []
+    keep_mask = pd.Series(False, index=raw.index)
 
-    if settings.exclude_failed_groups:
-        failed_keys = grouped.loc[grouped["qc_status"] != "PASS", ["Sample", "Gene"]]
-        if len(failed_keys) > 0:
-            key_tuples = set(map(tuple, failed_keys.to_numpy()))
-            mask = raw[["Sample", "Gene"]].apply(tuple, axis=1).isin(key_tuples)
-            clean = raw.loc[~mask].copy()
+    for (sample, gene), group in raw.groupby(["Sample", "Gene"]):
+        values = group["Ct"]
+        original_n = len(values)
+        original_min = values.min()
+        original_max = values.max()
+        original_spread = original_max - original_min if original_n else np.nan
+
+        if settings.apply_qc:
+            group_keep = select_replicates_for_group(values, settings.outlier_cutoff)
         else:
-            clean = raw.copy()
-    else:
-        clean = raw.copy()
+            group_keep = pd.Series(True, index=values.index)
 
-    return grouped, clean
+        kept_values = values[group_keep]
+        excluded_values = values[~group_keep]
+
+        n_used = len(kept_values)
+        if original_n == 1:
+            qc_status = "WARN_single_replicate"
+            use_group = True
+        elif n_used >= 2:
+            if len(excluded_values) == 0:
+                qc_status = "PASS"
+            else:
+                qc_status = "PASS_outlier_removed"
+            use_group = True
+        else:
+            qc_status = "FAIL_no_two_replicates_within_cutoff"
+            use_group = False
+
+        if use_group:
+            keep_mask.loc[kept_values.index] = True
+
+        rows.append({
+            "Sample": sample,
+            "Gene": gene,
+            "n_replicates_original": original_n,
+            "n_used": n_used if use_group else 0,
+            "n_excluded": len(excluded_values) if use_group else original_n,
+            "min_ct_original": original_min,
+            "max_ct_original": original_max,
+            "ct_spread_original": original_spread,
+            "mean_ct_used": kept_values.mean() if use_group else np.nan,
+            "sd_ct_used": kept_values.std() if use_group else np.nan,
+            "ct_values_used": ", ".join(f"{x:.3f}" for x in kept_values.tolist()) if use_group else "",
+            "ct_values_excluded": ", ".join(f"{x:.3f}" for x in excluded_values.tolist()) if len(excluded_values) else "",
+            "qc_status": qc_status,
+        })
+
+    qc = pd.DataFrame(rows)
+    clean = raw.loc[keep_mask].copy() if settings.apply_qc else raw.copy()
+    return qc, clean
 
 
 def calculate_results(clean: pd.DataFrame, settings: AnalysisSettings) -> Dict[str, pd.DataFrame]:
@@ -129,8 +199,9 @@ def calculate_results(clean: pd.DataFrame, settings: AnalysisSettings) -> Dict[s
     missing_hk = delta_ct[delta_ct["housekeeping_mean_ct"].isna()]["Sample"].unique()
     if len(missing_hk) > 0:
         raise ValueError(
-            "Some samples are missing housekeeping data: "
+            "Some samples are missing usable housekeeping data after QC: "
             + ", ".join(map(str, missing_hk))
+            + ". Check the QC tab for failed housekeeping groups."
         )
 
     control = delta_ct[delta_ct["Sample"] == settings.control_sample]
@@ -145,7 +216,6 @@ def calculate_results(clean: pd.DataFrame, settings: AnalysisSettings) -> Dict[s
     ddct["delta_delta_ct"] = ddct["delta_ct"] - ddct["control_delta_ct"]
     ddct["fold_change"] = np.power(2, -ddct["delta_delta_ct"])
 
-    # Keep a clean display order.
     cols = [
         "Sample", "Gene", "n_used", "mean_ct", "sd_ct",
         "housekeeping_mean_ct", "housekeeping_genes_used",
@@ -174,8 +244,10 @@ def make_excel_report(raw, qc, clean, outputs) -> bytes:
 
         workbook = writer.book
         number_fmt = workbook.add_format({"num_format": "0.000"})
-        for sheet in writer.sheets.values():
-            sheet.set_column(0, 20, 18, number_fmt)
+        header_fmt = workbook.add_format({"bold": True})
+        for sheet_name, sheet in writer.sheets.items():
+            sheet.set_row(0, None, header_fmt)
+            sheet.set_column(0, 30, 18, number_fmt)
 
     return buffer.getvalue()
 
@@ -220,23 +292,24 @@ def app():
             )
 
             outlier_cutoff = st.number_input(
-                "Fail replicate group if Ct spread is greater than",
+                "Ct cutoff for keeping replicate values together",
                 min_value=0.0,
                 max_value=5.0,
                 value=1.0,
                 step=0.1,
+                help="The app keeps the largest set of replicates where max Ct - min Ct is within this cutoff.",
             )
-            exclude_failed_groups = st.checkbox(
-                "Exclude failed replicate groups from analysis",
+            apply_qc = st.checkbox(
+                "Apply QC and remove outlier replicates",
                 value=True,
-                help="If checked, an entire sample/gene group is removed when max Ct - min Ct exceeds the cutoff.",
+                help="With triplicates, one outlier can be removed while the remaining two are still used.",
             )
 
         settings = AnalysisSettings(
             control_sample=control_sample,
             housekeeping_genes=housekeeping_genes,
             outlier_cutoff=float(outlier_cutoff),
-            exclude_failed_groups=exclude_failed_groups,
+            apply_qc=apply_qc,
         )
 
         if not settings.housekeeping_genes:
@@ -251,7 +324,7 @@ def app():
         top1.metric("Rows uploaded", len(raw))
         top2.metric("Rows used", len(clean))
         top3.metric("Sample/gene groups", len(qc))
-        top4.metric("QC failed groups", int((qc["qc_status"] != "PASS").sum()))
+        top4.metric("Outlier values removed", int(qc["n_excluded"].sum()) if apply_qc else 0)
 
         tabs = st.tabs(["Results", "Plots", "QC", "Raw/Clean data", "Export"])
 
@@ -301,12 +374,13 @@ def app():
         with tabs[2]:
             st.subheader("Replicate QC")
             st.dataframe(qc, use_container_width=True)
-            failed = qc[qc["qc_status"] != "PASS"]
-            if not failed.empty:
-                st.warning("Some replicate groups failed the Ct spread cutoff.")
-                st.dataframe(failed, use_container_width=True)
+
+            flagged = qc[qc["qc_status"] != "PASS"]
+            if not flagged.empty:
+                st.warning("Some groups had outliers, single replicates, or failed QC.")
+                st.dataframe(flagged, use_container_width=True)
             else:
-                st.success("All replicate groups passed the current spread cutoff.")
+                st.success("All replicate groups passed without outlier removal.")
 
         with tabs[3]:
             left, right = st.columns(2)
