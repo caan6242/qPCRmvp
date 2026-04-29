@@ -1,27 +1,8 @@
-# qPCR Studio MVP v2
+# qPCR Studio
 
-A private web app for cleaned qPCR Ct data.
+A private Streamlit app for qPCR Ct/Cq analysis.
 
-Input format:
-
-| Sample | Gene | Ct |
-|---|---|---|
-| Control | INS | 24.1 |
-| Control | INS | 24.3 |
-| HG | INS | 25.7 |
-| HG+PA | RPLP0 | 19.4 |
-
-The app calculates:
-
-- replicate QC
-- outlier replicate removal
-- mean Ct
-- housekeeping mean Ct
-- ΔCt
-- ΔΔCt against a selected control sample
-- fold change using 2^-ΔΔCt
-- plots per gene
-- downloadable Excel report
+The app can now work with cleaned long-form data, many common raw qPCR export column names, and simple wide Ct tables. It calculates replicate QC, geometric-mean housekeeping normalisation on the expression scale, ΔCt, ΔΔCt, fold change, experiment-level summaries, trend interpretation, charts, and a downloadable Excel report.
 
 ## Quick start
 
@@ -34,19 +15,55 @@ streamlit run app.py
 
 Upload these files to your GitHub repo and redeploy on Streamlit Community Cloud.
 
-## Required columns
+## Recommended input format
+
+| Experiment | Sample | Gene | Ct | Replicate |
+|---|---|---|---:|---:|
+| Exp 1 | Control | INS | 24.1 | 1 |
+| Exp 1 | Control | INS | 24.3 | 2 |
+| Exp 1 | HG | INS | 25.7 | 1 |
+| Exp 2 | HG+PA | RPLP0 | 19.4 | 3 |
+
+Minimum required biological fields:
 
 - `Sample`
-- `Gene`
-- `Ct`
+- `Gene` or `Target`
+- `Ct`, `Cq`, or `Cp`
+
+Optional but useful fields:
+
+- `Experiment`, `Run`, `Plate`, or `Batch` for comparing repeated experiments
+- `Replicate` or `Well` for traceability
 
 Column names are case-insensitive. Extra columns are ignored.
 
-## v2 QC behavior
+## Raw-data recognition
 
-This version does **not** remove an entire sample/gene group just because the full replicate spread is too large.
+The app recognises common qPCR export headings such as:
 
-Instead:
+- sample: `Sample Name`, `Sample ID`, `Condition`, `Treatment`, `Group`
+- target: `Target Name`, `Assay`, `Primer`, `Gene Symbol`
+- Ct/Cq: `Ct`, `Cq`, `Cp`, `Cycle Threshold`, `Ct Mean`
+- experiment: `Experiment`, `Run`, `Plate`, `Batch`
+- replicate: `Replicate`, `Well`, `Position`
+
+It also accepts a simple wide table where rows are samples and numeric gene columns contain Ct values. For Excel files with multiple sheets, each sheet is treated as a separate experiment if no experiment column is present.
+
+## Calculations
+
+Ct values are logarithmic. For multiple housekeeping genes, qPCR Studio averages housekeeping Ct values per sample and experiment, which is equivalent to using the geometric mean on the original expression scale.
+
+ΔCt = target mean Ct - housekeeping mean Ct
+
+ΔΔCt = sample ΔCt - control ΔCt for the same gene in the same experiment
+
+Fold change = 2^-ΔΔCt
+
+log2 fold change = -ΔΔCt
+
+## QC behavior
+
+The app does not remove an entire sample/gene group just because the full replicate spread is too large.
 
 - If all replicates are within the cutoff, all are kept.
 - If one replicate is an outlier, the app keeps the largest subset where max Ct - min Ct is within the cutoff.
@@ -54,12 +71,17 @@ Instead:
 - A group only fails if it cannot find at least two replicates within the cutoff.
 - Single replicates are allowed but flagged as `WARN_single_replicate`.
 
-## Normalization
+## Charts and insights
 
-Ct values are logarithmic. For multiple housekeeping genes, this app uses the arithmetic mean of housekeeping Ct values per sample, which is equivalent to using the geometric mean on the original expression scale.
+The app includes:
 
-ΔCt = target mean Ct - housekeeping mean Ct
+- fold-change bar plots
+- log2 fold-change dot plots
+- fold-change heatmap
+- ΔCt plots
+- raw Ct/Cq replicate box plots
+- replicate QC spread plots
+- experiment-to-experiment trend plots
+- ranked trend interpretation with QC-aware suggestions for follow-up experiments
 
-ΔΔCt = sample ΔCt - mean control ΔCt for the same gene
-
-Fold change = 2^-ΔΔCt
+The trend summaries are hypothesis-generating. Use them together with your assay design, biological replicates, controls, and domain knowledge.
