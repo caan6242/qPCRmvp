@@ -85,3 +85,17 @@ The app includes:
 - ranked trend interpretation with QC-aware suggestions for follow-up experiments
 
 The trend summaries are hypothesis-generating. Use them together with your assay design, biological replicates, controls, and domain knowledge.
+
+## Past experiments
+
+Use the `Export` tab to save the current analysis into the in-app experiment library. The `Past experiments` tab then lets you:
+
+- review saved analyses with metadata
+- compare selected experiments
+- see cross-experiment trend summaries
+- generate comparison charts
+- export selected experiments together as one Excel workbook
+- download the full experiment library as JSON
+- import a previous library JSON file later
+
+Streamlit Community Cloud does not provide reliable permanent local storage for app files, so the in-app library is remembered during the current browser/app session. Download the JSON library when you want to keep the history and import it next time.

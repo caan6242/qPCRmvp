@@ -1,7 +1,10 @@
 import io
+import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -199,6 +202,24 @@ def read_uploaded_file(uploaded_file) -> pd.DataFrame:
             raise ValueError("The Excel file did not contain any usable sheets.")
         return pd.concat(usable, ignore_index=True)
     raise ValueError("Please upload a CSV or Excel file.")
+
+
+def read_uploaded_files(uploaded_files) -> pd.DataFrame:
+    if uploaded_files is None:
+        raise ValueError("No file was uploaded.")
+    if not isinstance(uploaded_files, list):
+        return read_uploaded_file(uploaded_files)
+
+    frames = []
+    for uploaded_file in uploaded_files:
+        frame = read_uploaded_file(uploaded_file)
+        if find_column(frame, "experiment") is None:
+            frame["Experiment"] = re.sub(r"\.[^.]+$", "", uploaded_file.name)
+        frames.append(frame)
+
+    if not frames:
+        raise ValueError("No file was uploaded.")
+    return pd.concat(frames, ignore_index=True)
 
 
 def make_example_data() -> pd.DataFrame:
@@ -567,8 +588,398 @@ def add_heatmap(plot_df: pd.DataFrame) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
+def initialise_experiment_library() -> None:
+    if "experiment_library" not in st.session_state:
+        st.session_state.experiment_library = []
+
+
+def frame_to_records(df: pd.DataFrame) -> List[Dict]:
+    if df is None or df.empty:
+        return []
+    clean = df.replace({np.nan: None})
+    return clean.to_dict(orient="records")
+
+
+def records_to_frame(records: List[Dict]) -> pd.DataFrame:
+    return pd.DataFrame(records or [])
+
+
+def library_label(entry: Dict) -> str:
+    return f"{entry.get('name', 'Untitled')} ({entry.get('saved_at', '')[:16]})"
+
+
+def make_library_entry(
+    name: str,
+    metadata: Dict,
+    settings: AnalysisSettings,
+    raw: pd.DataFrame,
+    qc: pd.DataFrame,
+    clean: pd.DataFrame,
+    outputs: Dict[str, pd.DataFrame],
+    insights: pd.DataFrame,
+    insight_notes: List[str],
+) -> Dict:
+    return {
+        "id": str(uuid4()),
+        "name": name.strip() or f"Experiment {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "metadata": metadata,
+        "settings": {
+            "control_sample": settings.control_sample,
+            "housekeeping_genes": settings.housekeeping_genes,
+            "outlier_cutoff": settings.outlier_cutoff,
+            "apply_qc": settings.apply_qc,
+        },
+        "tables": {
+            "raw": frame_to_records(raw),
+            "qc": frame_to_records(qc),
+            "clean": frame_to_records(clean),
+            "mean_ct": frame_to_records(outputs["mean_ct"]),
+            "housekeeping_summary": frame_to_records(outputs["housekeeping_summary"]),
+            "delta_ct": frame_to_records(outputs["delta_ct"]),
+            "final_results": frame_to_records(outputs["final_results"]),
+            "across_experiments": frame_to_records(outputs["across_experiments"]),
+            "insights": frame_to_records(insights),
+        },
+        "insight_notes": insight_notes,
+    }
+
+
+def export_library_json(entries: List[Dict]) -> bytes:
+    payload = {
+        "schema": "qpcr_studio_experiment_library_v1",
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "experiments": entries,
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def import_library_json(uploaded_file) -> List[Dict]:
+    payload = json.loads(uploaded_file.getvalue().decode("utf-8"))
+    if isinstance(payload, list):
+        return payload
+    if payload.get("schema") != "qpcr_studio_experiment_library_v1":
+        raise ValueError("This does not look like a qPCR Studio experiment library export.")
+    return payload.get("experiments", [])
+
+
+def add_entry_name(df: pd.DataFrame, entry: Dict) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    out.insert(0, "Library_Experiment", entry.get("name", "Untitled"))
+    out.insert(1, "Saved_At", entry.get("saved_at", ""))
+    for key, value in entry.get("metadata", {}).items():
+        out[key] = value
+    return out
+
+
+def combine_library_table(entries: List[Dict], table_name: str) -> pd.DataFrame:
+    frames = []
+    for entry in entries:
+        df = records_to_frame(entry.get("tables", {}).get(table_name, []))
+        if not df.empty:
+            frames.append(add_entry_name(df, entry))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def safe_sheet_name(name: str, used: set) -> str:
+    base = re.sub(r"[\[\]:*?/\\]", "_", name)[:31] or "Sheet"
+    candidate = base
+    index = 2
+    while candidate in used:
+        suffix = f"_{index}"
+        candidate = f"{base[:31 - len(suffix)]}{suffix}"
+        index += 1
+    used.add(candidate)
+    return candidate
+
+
+def make_multi_experiment_excel(entries: List[Dict]) -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+        used_sheets = set()
+        for table_name, sheet_name in [
+            ("final_results", "Combined_Fold_Change"),
+            ("across_experiments", "Combined_Summary"),
+            ("insights", "Combined_Insights"),
+            ("qc", "Combined_QC"),
+            ("raw", "Combined_Raw"),
+        ]:
+            combined = combine_library_table(entries, table_name)
+            if not combined.empty:
+                combined.to_excel(writer, index=False, sheet_name=safe_sheet_name(sheet_name, used_sheets))
+
+        overview_rows = []
+        for entry in entries:
+            final = records_to_frame(entry.get("tables", {}).get("final_results", []))
+            qc = records_to_frame(entry.get("tables", {}).get("qc", []))
+            overview_rows.append(
+                {
+                    "Library_Experiment": entry.get("name"),
+                    "Saved_At": entry.get("saved_at"),
+                    "Samples": final["Sample"].nunique() if "Sample" in final else 0,
+                    "Genes": final["Gene"].nunique() if "Gene" in final else 0,
+                    "Runs_or_Plates": final["Experiment"].nunique() if "Experiment" in final else 0,
+                    "QC_Flagged_Groups": int((qc["qc_status"] != "PASS").sum()) if "qc_status" in qc else 0,
+                    **entry.get("metadata", {}),
+                }
+            )
+        pd.DataFrame(overview_rows).to_excel(writer, index=False, sheet_name=safe_sheet_name("Overview", used_sheets))
+
+        for entry in entries:
+            final = records_to_frame(entry.get("tables", {}).get("final_results", []))
+            if not final.empty:
+                final.to_excel(writer, index=False, sheet_name=safe_sheet_name(entry.get("name", "Experiment"), used_sheets))
+
+        workbook = writer.book
+        number_fmt = workbook.add_format({"num_format": "0.000"})
+        header_fmt = workbook.add_format({"bold": True})
+        for sheet in writer.sheets.values():
+            sheet.set_row(0, None, header_fmt)
+            sheet.set_column(0, 40, 18, number_fmt)
+
+    return buffer.getvalue()
+
+
+def build_cross_experiment_insights(combined_final: pd.DataFrame, control_sample: str) -> pd.DataFrame:
+    if combined_final.empty:
+        return pd.DataFrame()
+
+    data = combined_final[combined_final["Sample"] != control_sample].copy()
+    if data.empty:
+        return pd.DataFrame()
+
+    summary = data.groupby(["Sample", "Gene"], as_index=False).agg(
+        saved_experiments=("Library_Experiment", "nunique"),
+        runs_or_plates=("Experiment", "nunique"),
+        mean_fold_change=("fold_change", "mean"),
+        median_fold_change=("fold_change", "median"),
+        mean_log2_fold_change=("log2_fold_change", "mean"),
+        sd_log2_fold_change=("log2_fold_change", "std"),
+        min_fold_change=("fold_change", "min"),
+        max_fold_change=("fold_change", "max"),
+    )
+    classified = summary.apply(
+        lambda row: classify_trend(
+            row["mean_log2_fold_change"],
+            row["saved_experiments"],
+            row["sd_log2_fold_change"],
+        ),
+        axis=1,
+        result_type="expand",
+    )
+    summary["cross_experiment_trend"] = classified[0]
+    summary["confidence"] = classified[1]
+    summary["suggested_next_step"] = summary.apply(make_suggestion, axis=1)
+    return summary.sort_values("mean_log2_fold_change", key=lambda s: s.abs(), ascending=False).reset_index(drop=True)
+
+
+def render_save_current_analysis(raw, qc, clean, outputs, insights, insight_notes, settings) -> None:
+    st.subheader("Save current analysis")
+    with st.form("save_current_analysis"):
+        default_name = ", ".join(sorted(raw["Experiment"].unique())[:3])
+        experiment_name = st.text_input("Experiment name", value=default_name or "qPCR experiment")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            experiment_date = st.date_input("Experiment date")
+        with c2:
+            cell_model = st.text_input("Cell type / model", value="")
+        with c3:
+            treatment = st.text_input("Treatment / condition", value="")
+        notes = st.text_area("Notes", value="")
+        submitted = st.form_submit_button("Save to past experiments")
+
+    if submitted:
+        metadata = {
+            "Experiment_Date": experiment_date.isoformat(),
+            "Cell_Model": cell_model,
+            "Treatment": treatment,
+            "Notes": notes,
+        }
+        entry = make_library_entry(
+            experiment_name,
+            metadata,
+            settings,
+            raw,
+            qc,
+            clean,
+            outputs,
+            insights,
+            insight_notes,
+        )
+        st.session_state.experiment_library.append(entry)
+        st.success(f"Saved '{entry['name']}' to Past experiments.")
+
+
+def render_past_experiments_tab(current_control_sample: str) -> None:
+    st.subheader("Past experiments")
+    library = st.session_state.experiment_library
+
+    import_col, export_col = st.columns(2)
+    with import_col:
+        imported = st.file_uploader("Import experiment library JSON", type=["json"], key="library_import")
+        if imported is not None and st.button("Import library", key="import_library_button"):
+            imported_entries = import_library_json(imported)
+            existing_ids = {entry.get("id") for entry in library}
+            added = 0
+            for entry in imported_entries:
+                if entry.get("id") not in existing_ids:
+                    library.append(entry)
+                    added += 1
+            st.success(f"Imported {added} experiment(s).")
+    with export_col:
+        st.download_button(
+            "Download full library JSON",
+            data=export_library_json(library),
+            file_name="qpcr_studio_experiment_library.json",
+            mime="application/json",
+            disabled=not library,
+        )
+
+    if not library:
+        st.info("Save the current analysis to start building your experiment library.")
+        return
+
+    overview_rows = []
+    for entry in library:
+        final = records_to_frame(entry.get("tables", {}).get("final_results", []))
+        qc = records_to_frame(entry.get("tables", {}).get("qc", []))
+        overview_rows.append(
+            {
+                "id": entry.get("id"),
+                "Name": entry.get("name"),
+                "Saved": entry.get("saved_at"),
+                "Samples": final["Sample"].nunique() if "Sample" in final else 0,
+                "Genes": final["Gene"].nunique() if "Gene" in final else 0,
+                "Runs/plates": final["Experiment"].nunique() if "Experiment" in final else 0,
+                "QC flagged": int((qc["qc_status"] != "PASS").sum()) if "qc_status" in qc else 0,
+                **entry.get("metadata", {}),
+            }
+        )
+    overview = pd.DataFrame(overview_rows)
+    st.dataframe(overview.drop(columns=["id"]), use_container_width=True)
+
+    labels = {library_label(entry): entry.get("id") for entry in library}
+    default_labels = list(labels.keys())[-min(3, len(labels)) :]
+    selected_labels = st.multiselect(
+        "Select experiments to compare/export",
+        list(labels.keys()),
+        default=default_labels,
+    )
+    selected_ids = {labels[label] for label in selected_labels}
+    selected_entries = [entry for entry in library if entry.get("id") in selected_ids]
+
+    if st.button("Remove selected from library", disabled=not selected_entries):
+        st.session_state.experiment_library = [entry for entry in library if entry.get("id") not in selected_ids]
+        st.success("Removed selected experiment(s).")
+        st.rerun()
+
+    if not selected_entries:
+        return
+
+    combined_final = combine_library_table(selected_entries, "final_results")
+    combined_qc = combine_library_table(selected_entries, "qc")
+    cross_insights = build_cross_experiment_insights(combined_final, current_control_sample)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Selected saved experiments", len(selected_entries))
+    c2.metric("Combined rows", len(combined_final))
+    c3.metric("Genes", combined_final["Gene"].nunique() if "Gene" in combined_final else 0)
+    c4.metric("QC flagged groups", int((combined_qc["qc_status"] != "PASS").sum()) if "qc_status" in combined_qc else 0)
+
+    st.download_button(
+        "Download selected experiments as Excel",
+        data=make_multi_experiment_excel(selected_entries),
+        file_name="qpcr_studio_selected_experiments.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    compare_tabs = st.tabs(["Comparison summary", "Comparison charts", "Combined data"])
+    with compare_tabs[0]:
+        if cross_insights.empty:
+            st.info("No non-control comparison trends available for the selected experiments.")
+        else:
+            st.dataframe(cross_insights, use_container_width=True)
+            strongest = cross_insights.iloc[0]
+            st.info(
+                f"Across selected experiments, {strongest.Sample} shows {strongest.cross_experiment_trend} "
+                f"for {strongest.Gene} (mean FC {strongest.mean_fold_change:.2f}). "
+                + strongest.suggested_next_step
+            )
+
+    with compare_tabs[1]:
+        if combined_final.empty:
+            st.info("No fold-change rows are available for the selected experiments.")
+        else:
+            genes = sorted(combined_final["Gene"].dropna().unique())
+            samples = sorted(combined_final["Sample"].dropna().unique())
+            selected_genes = st.multiselect(
+                "Comparison genes",
+                genes,
+                default=genes[: min(6, len(genes))],
+                key="library_genes",
+            )
+            selected_samples = st.multiselect(
+                "Comparison samples",
+                samples,
+                default=samples,
+                key="library_samples",
+            )
+            chart_df = combined_final[
+                combined_final["Gene"].isin(selected_genes)
+                & combined_final["Sample"].isin(selected_samples)
+            ].copy()
+            if chart_df.empty:
+                st.info("Select at least one gene and sample.")
+            else:
+                fig = px.strip(
+                    chart_df,
+                    x="Sample",
+                    y="log2_fold_change",
+                    color="Library_Experiment",
+                    facet_col="Gene",
+                    hover_data=["Experiment", "fold_change", "delta_delta_ct"],
+                    title="log2 fold change across saved experiments",
+                )
+                fig.add_hline(y=0, line_dash="dash")
+                st.plotly_chart(fig, use_container_width=True)
+
+                heat = chart_df.groupby(["Library_Experiment", "Gene"], as_index=False).agg(
+                    mean_log2_fold_change=("log2_fold_change", "mean")
+                )
+                fig_heat = px.imshow(
+                    heat.pivot(index="Gene", columns="Library_Experiment", values="mean_log2_fold_change"),
+                    color_continuous_scale="RdBu_r",
+                    color_continuous_midpoint=0,
+                    aspect="auto",
+                    title="Saved experiment heatmap",
+                    labels={"color": "mean log2 FC"},
+                )
+                st.plotly_chart(fig_heat, use_container_width=True)
+
+                fig_box = px.box(
+                    chart_df,
+                    x="Sample",
+                    y="fold_change",
+                    color="Gene",
+                    points="all",
+                    hover_data=["Library_Experiment", "Experiment"],
+                    title="Fold-change spread across selected experiments",
+                )
+                fig_box.add_hline(y=1, line_dash="dash")
+                st.plotly_chart(fig_box, use_container_width=True)
+
+    with compare_tabs[2]:
+        st.subheader("Combined fold-change data")
+        st.dataframe(combined_final, use_container_width=True)
+        st.subheader("Combined QC data")
+        st.dataframe(combined_qc, use_container_width=True)
+
+
 def app():
     st.set_page_config(page_title="qPCR Studio", layout="wide")
+    initialise_experiment_library()
 
     st.title("qPCR Studio")
     st.caption(
@@ -577,15 +988,15 @@ def app():
 
     with st.sidebar:
         st.header("Input")
-        uploaded = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
-        use_example = st.toggle("Use example data", value=uploaded is None)
+        uploaded = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+        use_example = st.toggle("Use example data", value=len(uploaded) == 0)
 
         st.header("Analysis settings")
         st.write("Upload data first to select samples and genes.")
 
     try:
-        if uploaded is not None:
-            raw_input = read_uploaded_file(uploaded)
+        if uploaded:
+            raw_input = read_uploaded_files(uploaded)
         elif use_example:
             raw_input = make_example_data()
         else:
@@ -653,7 +1064,7 @@ def app():
             )
             st.dataframe(raw.head(50), use_container_width=True)
 
-        tabs = st.tabs(["Results", "Insights", "Plots", "QC", "Raw/Clean data", "Export"])
+        tabs = st.tabs(["Results", "Insights", "Plots", "QC", "Raw/Clean data", "Past experiments", "Export"])
 
         with tabs[0]:
             st.subheader("Fold-change results")
@@ -814,6 +1225,11 @@ def app():
                 st.dataframe(clean, use_container_width=True)
 
         with tabs[5]:
+            render_past_experiments_tab(settings.control_sample)
+
+        with tabs[6]:
+            render_save_current_analysis(raw, qc, clean, outputs, insights, insight_notes, settings)
+
             st.subheader("Download report")
             excel_bytes = make_excel_report(raw, qc, clean, outputs, insights)
             st.download_button(
