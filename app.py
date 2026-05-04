@@ -226,10 +226,10 @@ def read_uploaded_files(uploaded_files) -> pd.DataFrame:
         frame = read_uploaded_file(uploaded_file)
         file_experiment = re.sub(r"\.[^.]+$", "", uploaded_file.name).strip() or f"Experiment {file_index}"
         file_experiment = f"{file_index:02d} - {file_experiment}" if multi_file_upload else file_experiment
-        frame["Source_File"] = uploaded_file.name
-        frame["Upload_Experiment"] = file_experiment
 
         if multi_file_upload:
+            frame["Source_File"] = uploaded_file.name
+            frame["Upload_Experiment"] = file_experiment
             frame["Experiment"] = file_experiment
         else:
             experiment_col = find_column(frame, "experiment")
