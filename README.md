@@ -4,7 +4,7 @@ A private Streamlit app for qPCR Ct/Cq analysis.
 
 The app can now work with cleaned long-form data, many common raw qPCR export column names, and simple wide Ct tables. It calculates replicate QC, geometric-mean housekeeping normalisation on the expression scale, ΔCt, ΔΔCt, fold change, experiment-level summaries, trend interpretation, charts, and a downloadable Excel report.
 
-You can upload up to 10 experiment files at once. In multi-file uploads, the app keeps the filename in the experiment label, even when the file already contains a generic `Experiment`, `Run`, `Plate`, or Excel sheet name. This prevents separate files from being merged into one experiment by mistake.
+You can upload up to 10 experiment files at once. In multi-file uploads, the app uses the uploaded filename as the primary experiment label, for example `01 - 2026-04-21_plate_1`. This prevents separate files from being merged into one experiment even when they contain the same generic `Experiment`, `Run`, `Plate`, or Excel sheet name internally.
 
 ## Quick start
 

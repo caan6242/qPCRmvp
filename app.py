@@ -208,24 +208,29 @@ def read_uploaded_file(uploaded_file) -> pd.DataFrame:
 def read_uploaded_files(uploaded_files) -> pd.DataFrame:
     if uploaded_files is None:
         raise ValueError("No file was uploaded.")
-    if not isinstance(uploaded_files, list):
+    if not isinstance(uploaded_files, (list, tuple)):
         return read_uploaded_file(uploaded_files)
+    uploaded_files = list(uploaded_files)
     if len(uploaded_files) > MAX_UPLOAD_FILES:
         raise ValueError(f"Upload up to {MAX_UPLOAD_FILES} experiment files at a time.")
 
     frames = []
     multi_file_upload = len(uploaded_files) > 1
-    for uploaded_file in uploaded_files:
+    for file_index, uploaded_file in enumerate(uploaded_files, start=1):
         frame = read_uploaded_file(uploaded_file)
-        file_experiment = re.sub(r"\.[^.]+$", "", uploaded_file.name)
-        if find_column(frame, "experiment") is None:
+        file_experiment = re.sub(r"\.[^.]+$", "", uploaded_file.name).strip() or f"Experiment {file_index}"
+        file_experiment = f"{file_index:02d} - {file_experiment}" if multi_file_upload else file_experiment
+        frame["Source_File"] = uploaded_file.name
+
+        if multi_file_upload:
             frame["Experiment"] = file_experiment
         else:
             experiment_col = find_column(frame, "experiment")
-            frame[experiment_col] = frame[experiment_col].astype(str).str.strip()
-            frame.loc[frame[experiment_col].isin(["", "nan", "None"]), experiment_col] = file_experiment
-            if multi_file_upload:
-                frame[experiment_col] = file_experiment + " - " + frame[experiment_col]
+            if experiment_col is None:
+                frame["Experiment"] = file_experiment
+            else:
+                frame[experiment_col] = frame[experiment_col].astype(str).str.strip()
+                frame.loc[frame[experiment_col].isin(["", "nan", "None"]), experiment_col] = file_experiment
         frames.append(frame)
 
     if not frames:
