@@ -245,6 +245,40 @@ def read_uploaded_files(uploaded_files) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def prepare_uploaded_data(uploaded_files) -> pd.DataFrame:
+    """
+    Read uploaded files into the canonical app format.
+    Multi-file uploads are normalised one file at a time, then stamped with
+    the upload filename as Experiment. This avoids raw qPCR export columns,
+    Excel sheet names, or duplicated internal experiment names collapsing
+    separate uploads into one experiment.
+    """
+    if uploaded_files is None:
+        raise ValueError("No file was uploaded.")
+    if not isinstance(uploaded_files, (list, tuple)):
+        uploaded_files = [uploaded_files]
+    uploaded_files = list(uploaded_files)
+
+    if not uploaded_files:
+        raise ValueError("No file was uploaded.")
+    if len(uploaded_files) > MAX_UPLOAD_FILES:
+        raise ValueError(f"Upload up to {MAX_UPLOAD_FILES} experiment files at a time.")
+
+    if len(uploaded_files) == 1:
+        return force_experiment_from_uploaded_files(normalise_columns(read_uploaded_file(uploaded_files[0])))
+
+    frames = []
+    for file_index, uploaded_file in enumerate(uploaded_files, start=1):
+        file_label = re.sub(r"\.[^.]+$", "", uploaded_file.name).strip() or f"Experiment {file_index}"
+        experiment_label = f"{file_index:02d} - {file_label}"
+        normalised = normalise_columns(read_uploaded_file(uploaded_file))
+        normalised["Experiment"] = experiment_label
+        normalised["Source_File"] = uploaded_file.name
+        frames.append(normalised)
+
+    return pd.concat(frames, ignore_index=True)
+
+
 def force_experiment_from_uploaded_files(raw: pd.DataFrame) -> pd.DataFrame:
     """
     Last-line defence for Streamlit multi-file uploads.
@@ -1208,14 +1242,13 @@ def app():
 
     try:
         if uploaded:
-            raw_input = read_uploaded_files(uploaded)
+            raw = prepare_uploaded_data(uploaded)
         elif use_example:
             raw_input = make_example_data()
+            raw = force_experiment_from_uploaded_files(normalise_columns(raw_input))
         else:
             st.info("Upload a CSV/Excel file or enable example data.")
             return
-
-        raw = force_experiment_from_uploaded_files(normalise_columns(raw_input))
 
         samples = sorted(raw["Sample"].unique().tolist())
         genes = sorted(raw["Gene"].unique().tolist())
