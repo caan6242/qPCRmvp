@@ -245,6 +245,29 @@ def read_uploaded_files(uploaded_files) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def force_experiment_from_uploaded_files(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Last-line defence for Streamlit multi-file uploads.
+    If several uploaded source files are present, the filename becomes the
+    experiment ID used for every downstream calculation, chart, and export.
+    """
+    if "Source_File" not in raw.columns:
+        return raw
+
+    sources = [s for s in raw["Source_File"].dropna().astype(str).unique() if s.strip()]
+    if len(sources) <= 1:
+        return raw
+
+    out = raw.copy()
+    source_labels = {}
+    for index, source in enumerate(sources, start=1):
+        label = re.sub(r"\.[^.]+$", "", source).strip() or f"Experiment {index}"
+        source_labels[source] = f"{index:02d} - {label}"
+
+    out["Experiment"] = out["Source_File"].astype(str).map(source_labels).fillna(out["Experiment"])
+    return out
+
+
 def make_example_data() -> pd.DataFrame:
     rows = []
     experiments = ["Exp 1", "Exp 2"]
@@ -1192,7 +1215,7 @@ def app():
             st.info("Upload a CSV/Excel file or enable example data.")
             return
 
-        raw = normalise_columns(raw_input)
+        raw = force_experiment_from_uploaded_files(normalise_columns(raw_input))
 
         samples = sorted(raw["Sample"].unique().tolist())
         genes = sorted(raw["Gene"].unique().tolist())
