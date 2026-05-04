@@ -214,6 +214,7 @@ def read_uploaded_files(uploaded_files) -> pd.DataFrame:
         raise ValueError(f"Upload up to {MAX_UPLOAD_FILES} experiment files at a time.")
 
     frames = []
+    multi_file_upload = len(uploaded_files) > 1
     for uploaded_file in uploaded_files:
         frame = read_uploaded_file(uploaded_file)
         file_experiment = re.sub(r"\.[^.]+$", "", uploaded_file.name)
@@ -223,6 +224,8 @@ def read_uploaded_files(uploaded_files) -> pd.DataFrame:
             experiment_col = find_column(frame, "experiment")
             frame[experiment_col] = frame[experiment_col].astype(str).str.strip()
             frame.loc[frame[experiment_col].isin(["", "nan", "None"]), experiment_col] = file_experiment
+            if multi_file_upload:
+                frame[experiment_col] = file_experiment + " - " + frame[experiment_col]
         frames.append(frame)
 
     if not frames:
