@@ -141,7 +141,7 @@ def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     sample_col = find_column(df, "sample")
     gene_col = find_column(df, "gene")
     ct_col = find_column(df, "ct")
-    experiment_col = find_column(df, "experiment")
+    experiment_col = "Upload_Experiment" if "Upload_Experiment" in df.columns else find_column(df, "experiment")
     replicate_col = find_column(df, "replicate")
 
     if not all([sample_col, gene_col, ct_col]):
@@ -166,6 +166,9 @@ def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     if experiment_col and experiment_col not in keep:
         keep.append(experiment_col)
         rename[experiment_col] = "Experiment"
+    if "Source_File" in df.columns and "Source_File" not in keep:
+        keep.append("Source_File")
+        rename["Source_File"] = "Source_File"
     if replicate_col and replicate_col not in keep:
         keep.append(replicate_col)
         rename[replicate_col] = "Replicate"
@@ -182,7 +185,10 @@ def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = out.dropna(subset=["Sample", "Gene", "Ct"])
     out = out[(out["Sample"] != "") & (out["Gene"] != "")]
     out.loc[out["Experiment"].isin(["", "nan", "None"]), "Experiment"] = "Experiment 1"
-    return out[["Experiment", "Sample", "Gene", "Ct", "Replicate"]].reset_index(drop=True)
+    columns = ["Experiment", "Sample", "Gene", "Ct", "Replicate"]
+    if "Source_File" in out.columns:
+        columns.append("Source_File")
+    return out[columns].reset_index(drop=True)
 
 
 def read_uploaded_file(uploaded_file) -> pd.DataFrame:
@@ -221,6 +227,7 @@ def read_uploaded_files(uploaded_files) -> pd.DataFrame:
         file_experiment = re.sub(r"\.[^.]+$", "", uploaded_file.name).strip() or f"Experiment {file_index}"
         file_experiment = f"{file_index:02d} - {file_experiment}" if multi_file_upload else file_experiment
         frame["Source_File"] = uploaded_file.name
+        frame["Upload_Experiment"] = file_experiment
 
         if multi_file_upload:
             frame["Experiment"] = file_experiment
