@@ -14,6 +14,7 @@ import streamlit as st
 
 DISPLAY_COLUMNS = ["Experiment", "Sample", "Gene", "Ct"]
 GROUP_COLUMNS = ["Experiment", "Sample", "Gene"]
+MAX_UPLOAD_FILES = 10
 
 ALIASES = {
     "sample": [
@@ -209,12 +210,19 @@ def read_uploaded_files(uploaded_files) -> pd.DataFrame:
         raise ValueError("No file was uploaded.")
     if not isinstance(uploaded_files, list):
         return read_uploaded_file(uploaded_files)
+    if len(uploaded_files) > MAX_UPLOAD_FILES:
+        raise ValueError(f"Upload up to {MAX_UPLOAD_FILES} experiment files at a time.")
 
     frames = []
     for uploaded_file in uploaded_files:
         frame = read_uploaded_file(uploaded_file)
+        file_experiment = re.sub(r"\.[^.]+$", "", uploaded_file.name)
         if find_column(frame, "experiment") is None:
-            frame["Experiment"] = re.sub(r"\.[^.]+$", "", uploaded_file.name)
+            frame["Experiment"] = file_experiment
+        else:
+            experiment_col = find_column(frame, "experiment")
+            frame[experiment_col] = frame[experiment_col].astype(str).str.strip()
+            frame.loc[frame[experiment_col].isin(["", "nan", "None"]), experiment_col] = file_experiment
         frames.append(frame)
 
     if not frames:
@@ -750,8 +758,10 @@ def build_cross_experiment_insights(combined_final: pd.DataFrame, control_sample
     if data.empty:
         return pd.DataFrame()
 
+    experiment_source = "Library_Experiment" if "Library_Experiment" in data.columns else "Experiment"
+
     summary = data.groupby(["Sample", "Gene"], as_index=False).agg(
-        saved_experiments=("Library_Experiment", "nunique"),
+        saved_experiments=(experiment_source, "nunique"),
         runs_or_plates=("Experiment", "nunique"),
         mean_fold_change=("fold_change", "mean"),
         median_fold_change=("fold_change", "median"),
@@ -810,6 +820,162 @@ def render_save_current_analysis(raw, qc, clean, outputs, insights, insight_note
         )
         st.session_state.experiment_library.append(entry)
         st.success(f"Saved '{entry['name']}' to Past experiments.")
+
+
+def render_current_batch_comparison(
+    raw: pd.DataFrame,
+    clean: pd.DataFrame,
+    final: pd.DataFrame,
+    qc: pd.DataFrame,
+    outputs: Dict[str, pd.DataFrame],
+    settings: AnalysisSettings,
+) -> None:
+    st.subheader("Uploaded experiment batch")
+
+    experiments = sorted(final["Experiment"].dropna().unique())
+    if len(experiments) <= 1:
+        st.info("Upload 2 to 10 experiment files, or include 2 to 10 Experiment/Run/Plate values, to compare trends between experiments.")
+        return
+
+    cross_insights = build_cross_experiment_insights(final, settings.control_sample)
+    flagged_qc = qc[qc["qc_status"] != "PASS"] if "qc_status" in qc else pd.DataFrame()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Experiments analysed", len(experiments))
+    c2.metric("Samples", final["Sample"].nunique())
+    c3.metric("Target genes", final["Gene"].nunique())
+    c4.metric("QC flagged groups", len(flagged_qc))
+
+    st.download_button(
+        "Download full batch Excel report",
+        data=make_excel_report(
+            raw,
+            qc,
+            clean,
+            outputs,
+            cross_insights,
+        ),
+        file_name="qpcr_studio_batch_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    batch_tabs = st.tabs(["Trend summary", "Experiment comparison", "Consistency", "Batch data"])
+
+    with batch_tabs[0]:
+        if cross_insights.empty:
+            st.info("No non-control trends are available for the uploaded batch.")
+        else:
+            st.dataframe(cross_insights, use_container_width=True)
+            strongest = cross_insights.iloc[0]
+            st.info(
+                f"Across this uploaded batch, {strongest.Sample} shows {strongest.cross_experiment_trend} "
+                f"for {strongest.Gene} (mean FC {strongest.mean_fold_change:.2f}, "
+                f"{int(strongest.saved_experiments)} experiment(s), {strongest.confidence}). "
+                + strongest.suggested_next_step
+            )
+
+    with batch_tabs[1]:
+        genes = sorted(final["Gene"].dropna().unique())
+        samples = sorted(final["Sample"].dropna().unique())
+        selected_genes = st.multiselect(
+            "Batch genes",
+            genes,
+            default=genes[: min(6, len(genes))],
+            key="batch_genes",
+        )
+        selected_samples = st.multiselect(
+            "Batch samples",
+            samples,
+            default=samples,
+            key="batch_samples",
+        )
+        chart_df = final[
+            final["Gene"].isin(selected_genes)
+            & final["Sample"].isin(selected_samples)
+        ].copy()
+
+        if chart_df.empty:
+            st.info("Select at least one gene and sample.")
+        else:
+            fig = px.line(
+                chart_df.sort_values("Experiment"),
+                x="Experiment",
+                y="log2_fold_change",
+                color="Sample",
+                line_group="Sample",
+                facet_col="Gene",
+                markers=True,
+                hover_data=["fold_change", "delta_delta_ct", "mean_ct"],
+                title="log2 fold change trend across uploaded experiments",
+            )
+            fig.add_hline(y=0, line_dash="dash")
+            st.plotly_chart(fig, use_container_width=True)
+
+            fig_points = px.strip(
+                chart_df,
+                x="Sample",
+                y="fold_change",
+                color="Experiment",
+                facet_col="Gene",
+                hover_data=["log2_fold_change", "delta_delta_ct"],
+                title="Fold-change spread across uploaded experiments",
+            )
+            fig_points.add_hline(y=1, line_dash="dash")
+            st.plotly_chart(fig_points, use_container_width=True)
+
+    with batch_tabs[2]:
+        if cross_insights.empty:
+            st.info("No consistency summary available.")
+        else:
+            consistency = cross_insights.copy()
+            consistency["abs_mean_log2_fold_change"] = consistency["mean_log2_fold_change"].abs()
+            consistency["priority"] = np.select(
+                [
+                    consistency["confidence"].eq("consistent") & (consistency["abs_mean_log2_fold_change"] >= 1),
+                    consistency["confidence"].eq("consistent") & (consistency["abs_mean_log2_fold_change"] >= 0.58),
+                    consistency["confidence"].isin(["variable", "inconsistent"]),
+                ],
+                ["high-confidence strong trend", "reproducible moderate trend", "repeat before interpreting"],
+                default="lower priority",
+            )
+            st.dataframe(
+                consistency[
+                    [
+                        "Sample",
+                        "Gene",
+                        "saved_experiments",
+                        "mean_fold_change",
+                        "mean_log2_fold_change",
+                        "sd_log2_fold_change",
+                        "cross_experiment_trend",
+                        "confidence",
+                        "priority",
+                        "suggested_next_step",
+                    ]
+                ],
+                use_container_width=True,
+            )
+
+            heat = final[final["Sample"] != settings.control_sample].groupby(
+                ["Experiment", "Gene"], as_index=False
+            ).agg(mean_log2_fold_change=("log2_fold_change", "mean"))
+            fig_heat = px.imshow(
+                heat.pivot(index="Gene", columns="Experiment", values="mean_log2_fold_change"),
+                color_continuous_scale="RdBu_r",
+                color_continuous_midpoint=0,
+                aspect="auto",
+                title="Mean log2 fold change by uploaded experiment",
+                labels={"color": "mean log2 FC"},
+            )
+            st.plotly_chart(fig_heat, use_container_width=True)
+
+    with batch_tabs[3]:
+        st.subheader("Batch fold-change results")
+        st.dataframe(final, use_container_width=True)
+        st.subheader("Batch across-experiment summary")
+        st.dataframe(outputs["across_experiments"], use_container_width=True)
+        st.subheader("Batch QC")
+        st.dataframe(qc, use_container_width=True)
 
 
 def render_past_experiments_tab(current_control_sample: str) -> None:
@@ -988,7 +1154,15 @@ def app():
 
     with st.sidebar:
         st.header("Input")
-        uploaded = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+        uploaded = st.file_uploader(
+            f"Upload 1 to {MAX_UPLOAD_FILES} experiment files",
+            type=["csv", "xlsx", "xls"],
+            accept_multiple_files=True,
+            help="Each file is treated as one experiment if it does not already contain an Experiment/Run/Plate column.",
+        )
+        if len(uploaded) > MAX_UPLOAD_FILES:
+            st.error(f"Please keep this batch to {MAX_UPLOAD_FILES} files or fewer.")
+            st.stop()
         use_example = st.toggle("Use example data", value=len(uploaded) == 0)
 
         st.header("Analysis settings")
@@ -1064,7 +1238,7 @@ def app():
             )
             st.dataframe(raw.head(50), use_container_width=True)
 
-        tabs = st.tabs(["Results", "Insights", "Plots", "QC", "Raw/Clean data", "Past experiments", "Export"])
+        tabs = st.tabs(["Results", "Insights", "Batch comparison", "Plots", "QC", "Raw/Clean data", "Past experiments", "Export"])
 
         with tabs[0]:
             st.subheader("Fold-change results")
@@ -1090,6 +1264,9 @@ def app():
                 st.write(f"- {note}")
 
         with tabs[2]:
+            render_current_batch_comparison(raw, clean, final, qc, outputs, settings)
+
+        with tabs[3]:
             st.subheader("Charts")
             selected_genes = st.multiselect(
                 "Genes to plot",
@@ -1204,7 +1381,7 @@ def app():
             else:
                 st.info("Select at least one gene and sample to plot.")
 
-        with tabs[3]:
+        with tabs[4]:
             st.subheader("Replicate QC")
             st.dataframe(qc, use_container_width=True)
 
@@ -1215,7 +1392,7 @@ def app():
             else:
                 st.success("All replicate groups passed without outlier removal.")
 
-        with tabs[4]:
+        with tabs[5]:
             left, right = st.columns(2)
             with left:
                 st.subheader("Recognised raw data")
@@ -1224,10 +1401,10 @@ def app():
                 st.subheader("Clean data used")
                 st.dataframe(clean, use_container_width=True)
 
-        with tabs[5]:
+        with tabs[6]:
             render_past_experiments_tab(settings.control_sample)
 
-        with tabs[6]:
+        with tabs[7]:
             render_save_current_analysis(raw, qc, clean, outputs, insights, insight_notes, settings)
 
             st.subheader("Download report")

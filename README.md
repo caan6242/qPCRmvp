@@ -4,6 +4,8 @@ A private Streamlit app for qPCR Ct/Cq analysis.
 
 The app can now work with cleaned long-form data, many common raw qPCR export column names, and simple wide Ct tables. It calculates replicate QC, geometric-mean housekeeping normalisation on the expression scale, ΔCt, ΔΔCt, fold change, experiment-level summaries, trend interpretation, charts, and a downloadable Excel report.
 
+You can upload up to 10 experiment files at once. If a file does not include an `Experiment`, `Run`, or `Plate` column, the app uses the filename as the experiment name so the batch can be analysed and compared automatically.
+
 ## Quick start
 
 ```bash
@@ -82,6 +84,8 @@ The app includes:
 - raw Ct/Cq replicate box plots
 - replicate QC spread plots
 - experiment-to-experiment trend plots
+- uploaded batch comparison across up to 10 experiments
+- batch consistency ranking for reproducible vs variable trends
 - ranked trend interpretation with QC-aware suggestions for follow-up experiments
 
 The trend summaries are hypothesis-generating. Use them together with your assay design, biological replicates, controls, and domain knowledge.
