@@ -85,6 +85,87 @@ def column_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value).lower())
 
 
+def sample_key(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value).strip()).casefold()
+
+
+def treatment_tokens(value: str) -> set:
+    text = sample_key(value)
+    text = text.replace("+", " plus ")
+    text = text.replace("&", " plus ")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    words = set(text.split())
+    compact = re.sub(r"[^a-z0-9]+", "", text)
+
+    tokens = set(words)
+    if "hg" in words or "highglucose" in compact or ("high" in words and "glucose" in words):
+        tokens.add("hg")
+    if (
+        "pa" in words
+        or "palmitate" in words
+        or "palmitic" in words
+        or "palmiticacid" in compact
+    ):
+        tokens.add("pa")
+    return tokens
+
+
+def canonical_sample_name(value: str) -> str:
+    text = sample_key(value)
+    compact = re.sub(r"[^a-z0-9]+", "", text)
+    tokens = treatment_tokens(value)
+
+    control_aliases = {"control", "ctrl", "vehicle", "untreated", "baseline"}
+    if compact in control_aliases or tokens.intersection(control_aliases):
+        return "Control"
+    if "hg" in tokens and "pa" in tokens:
+        return "HG+PA"
+    if "hg" in tokens:
+        return "HG"
+    if "pa" in tokens:
+        return "PA"
+    return re.sub(r"\s+", " ", str(value).strip())
+
+
+def standardise_sample_labels(raw: pd.DataFrame) -> pd.DataFrame:
+    out = raw.copy()
+    canonical_by_key = {}
+    labels = []
+    for sample in out["Sample"].astype(str):
+        canonical = canonical_sample_name(sample)
+        key = sample_key(canonical)
+        if key not in canonical_by_key:
+            canonical_by_key[key] = canonical
+        labels.append(canonical_by_key[key])
+    out["Sample"] = labels
+    return out
+
+
+def standardise_selected_control(raw: pd.DataFrame, control_sample: str) -> Tuple[pd.DataFrame, str]:
+    """
+    Treat control sample names case-insensitively while preserving the user's
+    selected display label. This prevents CONTROL/Control/control mismatches
+    between uploaded experiment files.
+    """
+    out = raw.copy()
+    selected_key = sample_key(control_sample)
+    matching = out["Sample"].map(sample_key).eq(selected_key)
+    if matching.any():
+        out.loc[matching, "Sample"] = control_sample
+    return out, control_sample
+
+
+def default_control_index(samples: List[str]) -> int:
+    preferred = {"control", "ctrl", "untreated", "vehicle"}
+    for idx, sample in enumerate(samples):
+        if sample_key(sample) in preferred:
+            return idx
+    for idx, sample in enumerate(samples):
+        if "control" in sample_key(sample):
+            return idx
+    return 0
+
+
 def find_column(df: pd.DataFrame, role: str) -> Optional[str]:
     keyed = {column_key(c): c for c in df.columns}
     for alias in ALIASES[role]:
@@ -1288,11 +1369,11 @@ def app():
         upload_summary = pd.DataFrame()
         if uploaded:
             prepared = prepare_uploaded_data(uploaded)
-            raw = prepared.raw
+            raw = standardise_sample_labels(prepared.raw)
             upload_summary = prepared.upload_summary
         elif use_example:
             raw_input = make_example_data()
-            raw = force_experiment_from_uploaded_files(normalise_columns(raw_input))
+            raw = standardise_sample_labels(force_experiment_from_uploaded_files(normalise_columns(raw_input)))
         else:
             st.info("Upload a CSV/Excel file or enable example data.")
             return
@@ -1310,7 +1391,7 @@ def app():
             st.stop()
 
         with st.sidebar:
-            default_control_idx = samples.index("Control") if "Control" in samples else 0
+            default_control_idx = default_control_index(samples)
             control_sample = st.selectbox("Control/reference sample", samples, index=default_control_idx)
 
             default_hk = [g for g in ["RPLP0", "TBP", "PPIA", "HPRT", "HPRT1", "GAPDH", "ACTB", "PBGD"] if g in genes]
@@ -1345,6 +1426,8 @@ def app():
             st.warning("Select at least one housekeeping gene.")
             return
 
+        raw, canonical_control = standardise_selected_control(raw, settings.control_sample)
+        settings.control_sample = canonical_control
         qc, clean = replicate_qc(raw, settings)
         outputs = calculate_results(clean, settings)
         final = outputs["final_results"]
