@@ -15,6 +15,7 @@ import streamlit as st
 DISPLAY_COLUMNS = ["Experiment", "Sample", "Gene", "Ct"]
 GROUP_COLUMNS = ["Experiment", "Sample", "Gene"]
 MAX_UPLOAD_FILES = 10
+APP_VERSION = "2026-05-07-multifile-rewrite"
 
 ALIASES = {
     "sample": [
@@ -72,6 +73,12 @@ class AnalysisSettings:
     housekeeping_genes: List[str]
     outlier_cutoff: float
     apply_qc: bool
+
+
+@dataclass
+class PreparedUpload:
+    raw: pd.DataFrame
+    upload_summary: pd.DataFrame
 
 
 def column_key(value: str) -> str:
@@ -245,7 +252,22 @@ def read_uploaded_files(uploaded_files) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def prepare_uploaded_data(uploaded_files) -> pd.DataFrame:
+def upload_file_label(uploaded_file, index: int, multi_file_upload: bool) -> str:
+    name = re.sub(r"\.[^.]+$", "", uploaded_file.name).strip() or f"Experiment {index}"
+    return f"{index:02d} - {name}" if multi_file_upload else name
+
+
+def upload_summary_row(uploaded_file, normalised: pd.DataFrame, experiment_label: str) -> Dict:
+    return {
+        "Uploaded file": uploaded_file.name,
+        "Assigned experiment": experiment_label,
+        "Rows recognised": len(normalised),
+        "Samples": normalised["Sample"].nunique() if "Sample" in normalised else 0,
+        "Genes": normalised["Gene"].nunique() if "Gene" in normalised else 0,
+    }
+
+
+def prepare_uploaded_data(uploaded_files) -> PreparedUpload:
     """
     Read uploaded files into the canonical app format.
     Multi-file uploads are normalised one file at a time, then stamped with
@@ -265,18 +287,39 @@ def prepare_uploaded_data(uploaded_files) -> pd.DataFrame:
         raise ValueError(f"Upload up to {MAX_UPLOAD_FILES} experiment files at a time.")
 
     if len(uploaded_files) == 1:
-        return force_experiment_from_uploaded_files(normalise_columns(read_uploaded_file(uploaded_files[0])))
+        raw = force_experiment_from_uploaded_files(normalise_columns(read_uploaded_file(uploaded_files[0])))
+        summary = pd.DataFrame(
+            [
+                {
+                    "Uploaded file": uploaded_files[0].name,
+                    "Assigned experiment": ", ".join(raw["Experiment"].drop_duplicates().astype(str).tolist()[:10]),
+                    "Rows recognised": len(raw),
+                    "Samples": raw["Sample"].nunique(),
+                    "Genes": raw["Gene"].nunique(),
+                }
+            ]
+        )
+        return PreparedUpload(raw=raw, upload_summary=summary)
 
     frames = []
+    summary_rows = []
     for file_index, uploaded_file in enumerate(uploaded_files, start=1):
-        file_label = re.sub(r"\.[^.]+$", "", uploaded_file.name).strip() or f"Experiment {file_index}"
-        experiment_label = f"{file_index:02d} - {file_label}"
+        experiment_label = upload_file_label(uploaded_file, file_index, multi_file_upload=True)
         normalised = normalise_columns(read_uploaded_file(uploaded_file))
         normalised["Experiment"] = experiment_label
         normalised["Source_File"] = uploaded_file.name
         frames.append(normalised)
+        summary_rows.append(upload_summary_row(uploaded_file, normalised, experiment_label))
 
-    return pd.concat(frames, ignore_index=True)
+    raw = pd.concat(frames, ignore_index=True)
+    expected = len(uploaded_files)
+    detected = raw["Experiment"].nunique()
+    if detected != expected:
+        raise ValueError(
+            f"Upload separation failed before analysis: Streamlit received {expected} files, "
+            f"but the app prepared {detected} experiments. Please reload the app and try again."
+        )
+    return PreparedUpload(raw=raw, upload_summary=pd.DataFrame(summary_rows))
 
 
 def force_experiment_from_uploaded_files(raw: pd.DataFrame) -> pd.DataFrame:
@@ -1223,6 +1266,7 @@ def app():
     st.caption(
         "Upload cleaned or raw qPCR Ct/Cq data -> QC -> ΔCt -> ΔΔCt -> fold change -> trends -> charts -> Excel report."
     )
+    st.caption(f"App version: {APP_VERSION}")
 
     with st.sidebar:
         st.header("Input")
@@ -1241,8 +1285,11 @@ def app():
         st.write("Upload data first to select samples and genes.")
 
     try:
+        upload_summary = pd.DataFrame()
         if uploaded:
-            raw = prepare_uploaded_data(uploaded)
+            prepared = prepare_uploaded_data(uploaded)
+            raw = prepared.raw
+            upload_summary = prepared.upload_summary
         elif use_example:
             raw_input = make_example_data()
             raw = force_experiment_from_uploaded_files(normalise_columns(raw_input))
@@ -1253,6 +1300,14 @@ def app():
         samples = sorted(raw["Sample"].unique().tolist())
         genes = sorted(raw["Gene"].unique().tolist())
         experiments = sorted(raw["Experiment"].unique().tolist())
+        if uploaded and len(uploaded) > 1 and len(experiments) != len(uploaded):
+            st.error(
+                f"Upload separation failed: Streamlit has {len(uploaded)} uploaded files, "
+                f"but the recognised data has {len(experiments)} experiment(s)."
+            )
+            if not upload_summary.empty:
+                st.dataframe(upload_summary, use_container_width=True)
+            st.stop()
 
         with st.sidebar:
             default_control_idx = samples.index("Control") if "Control" in samples else 0
@@ -1307,6 +1362,9 @@ def app():
                 f"Detected {len(experiments)} experiment(s), {len(samples)} sample(s), "
                 f"{len(genes)} gene/target(s)."
             )
+            if not upload_summary.empty:
+                st.subheader("Upload-to-experiment mapping")
+                st.dataframe(upload_summary, use_container_width=True)
             st.dataframe(raw.head(50), use_container_width=True)
 
         tabs = st.tabs(["Results", "Insights", "Batch comparison", "Plots", "QC", "Raw/Clean data", "Past experiments", "Export"])
