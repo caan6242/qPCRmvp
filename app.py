@@ -141,6 +141,55 @@ def standardise_sample_labels(raw: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def gene_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).strip().casefold())
+
+
+def canonical_gene_name(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value).strip())
+    compact = gene_key(text)
+    aliases = {
+        "rplp0": "RPLP0",
+        "tbp": "TBP",
+        "ppia": "PPIA",
+        "hprt": "HPRT",
+        "hprt1": "HPRT1",
+        "gapdh": "GAPDH",
+        "actb": "ACTB",
+        "pbgd": "PBGD",
+        "ins": "INS",
+        "iapp": "IAPP",
+        "pcsk1": "PCSK1",
+        "hspa5": "HSPA5",
+    }
+    if compact in aliases:
+        return aliases[compact]
+
+    # qPCR target exports often differ only by case, spaces, or punctuation.
+    # Use uppercase for compact gene-like symbols while preserving readable labels.
+    if re.fullmatch(r"[A-Za-z0-9_. -]+", text):
+        return text.upper().replace(" ", "")
+    return text
+
+
+def standardise_gene_labels(raw: pd.DataFrame) -> pd.DataFrame:
+    out = raw.copy()
+    canonical_by_key = {}
+    labels = []
+    for gene in out["Gene"].astype(str):
+        canonical = canonical_gene_name(gene)
+        key = gene_key(canonical)
+        if key not in canonical_by_key:
+            canonical_by_key[key] = canonical
+        labels.append(canonical_by_key[key])
+    out["Gene"] = labels
+    return out
+
+
+def standardise_labels(raw: pd.DataFrame) -> pd.DataFrame:
+    return standardise_gene_labels(standardise_sample_labels(raw))
+
+
 def standardise_selected_control(raw: pd.DataFrame, control_sample: str) -> Tuple[pd.DataFrame, str]:
     """
     Treat control sample names case-insensitively while preserving the user's
@@ -1383,11 +1432,11 @@ def app():
         upload_summary = pd.DataFrame()
         if uploaded:
             prepared = prepare_uploaded_data(uploaded)
-            raw = standardise_sample_labels(prepared.raw)
+            raw = standardise_labels(prepared.raw)
             upload_summary = prepared.upload_summary
         elif use_example:
             raw_input = make_example_data()
-            raw = standardise_sample_labels(force_experiment_from_uploaded_files(normalise_columns(raw_input)))
+            raw = standardise_labels(force_experiment_from_uploaded_files(normalise_columns(raw_input)))
         else:
             st.info("Upload a CSV/Excel file or enable example data.")
             return
