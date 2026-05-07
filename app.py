@@ -604,12 +604,21 @@ def calculate_results(clean: pd.DataFrame, settings: AnalysisSettings) -> Dict[s
     )
 
     ddct = delta_ct.merge(control_ref, on=["Experiment", "Gene"], how="left")
-    missing_control = ddct[ddct["control_delta_ct"].isna()]["Experiment"].unique()
-    if len(missing_control) > 0:
+    missing_control_reference = ddct[ddct["control_delta_ct"].isna()][
+        ["Experiment", "Gene", "Sample", "mean_ct", "delta_ct"]
+    ].sort_values(["Experiment", "Gene", "Sample"]).reset_index(drop=True)
+
+    if not missing_control_reference.empty:
+        ddct = ddct[ddct["control_delta_ct"].notna()].copy()
+
+    if ddct.empty:
+        missing_pairs = missing_control_reference[["Experiment", "Gene"]].drop_duplicates()
+        pairs = [f"{row.Experiment}/{row.Gene}" for row in missing_pairs.itertuples()]
         raise ValueError(
-            f"Control sample '{settings.control_sample}' is missing for these experiment(s): "
-            + ", ".join(map(str, missing_control))
-            + ". Add a control to each experiment or remove the experiment column."
+            f"No target genes could be compared because control references for '{settings.control_sample}' "
+            "were missing after QC. Missing experiment/gene reference(s): "
+            + ", ".join(pairs[:20])
+            + ". Check the QC tab for failed control target-gene groups."
         )
 
     ddct["delta_delta_ct"] = ddct["delta_ct"] - ddct["control_delta_ct"]
@@ -660,6 +669,7 @@ def calculate_results(clean: pd.DataFrame, settings: AnalysisSettings) -> Dict[s
         "across_experiments": across_experiments.sort_values(
             ["Gene", "Sample"]
         ).reset_index(drop=True),
+        "missing_control_reference": missing_control_reference,
     }
 
 
@@ -766,6 +776,8 @@ def make_excel_report(raw, qc, clean, outputs, insights) -> bytes:
         outputs["delta_ct"].to_excel(writer, index=False, sheet_name="Delta_Ct")
         outputs["final_results"].to_excel(writer, index=False, sheet_name="Fold_Change")
         outputs["across_experiments"].to_excel(writer, index=False, sheet_name="Experiment_Summary")
+        if "missing_control_reference" in outputs and not outputs["missing_control_reference"].empty:
+            outputs["missing_control_reference"].to_excel(writer, index=False, sheet_name="Missing_Control_Ref")
         if insights is not None and not insights.empty:
             insights.to_excel(writer, index=False, sheet_name="Insights")
 
@@ -843,6 +855,7 @@ def make_library_entry(
             "delta_ct": frame_to_records(outputs["delta_ct"]),
             "final_results": frame_to_records(outputs["final_results"]),
             "across_experiments": frame_to_records(outputs["across_experiments"]),
+            "missing_control_reference": frame_to_records(outputs.get("missing_control_reference", pd.DataFrame())),
             "insights": frame_to_records(insights),
         },
         "insight_notes": insight_notes,
@@ -907,6 +920,7 @@ def make_multi_experiment_excel(entries: List[Dict]) -> bytes:
             ("final_results", "Combined_Fold_Change"),
             ("across_experiments", "Combined_Summary"),
             ("insights", "Combined_Insights"),
+            ("missing_control_reference", "Missing_Control_Refs"),
             ("qc", "Combined_QC"),
             ("raw", "Combined_Raw"),
         ]:
@@ -1454,6 +1468,15 @@ def app():
 
         with tabs[0]:
             st.subheader("Fold-change results")
+            missing_control_ref = outputs.get("missing_control_reference", pd.DataFrame())
+            if not missing_control_ref.empty:
+                st.warning(
+                    f"{len(missing_control_ref)} row(s) could not be ΔΔCt-normalised because the selected "
+                    "control did not have a usable matching target-gene value in the same experiment after QC. "
+                    "The valid comparisons below were still analysed."
+                )
+                with st.expander("Missing control reference details", expanded=False):
+                    st.dataframe(missing_control_ref, use_container_width=True)
             st.dataframe(final, use_container_width=True)
 
             st.subheader("Across-experiment summary")
